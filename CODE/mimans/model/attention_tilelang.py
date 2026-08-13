@@ -1,13 +1,17 @@
-from __future__ import annotations
-
+# no "from __future__ import annotations" here: tilelang reads the prim_func
+# signature with get_type_hints, and PEP 563 would leave T.Tensor([batch, ...])
+# as a string that cannot see the enclosing function's locals.
 import argparse
 import itertools
 import math
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from mimans import paths  # noqa: F401  points the kernel cache at D:, must precede tilelang
 
 try:
     import tilelang
@@ -75,21 +79,36 @@ def bwd_configs(dim=128, limit=None):
             for s in (1, 2, 3) if bwd_smem(bm, bn, dim, s) <= limit]
 
 
-AUTOTUNE = True
-FWD_TILES = dict(block_M=128, block_N=64, threads=256, num_stages=1)
-BWD_TILES = dict(block_M=64, block_N=32, threads=128, num_stages=2)
+def fit_default(preferred, space):
+    """Keep the preferred tiles when the device allows them, otherwise take the
+    widest config of the same shape that fits.  sm_120 opts in to 99 KB per
+    block, not the 128 KB per SM, so 128x64 stages=1 (96 KB) is out of reach."""
+    if preferred in space:
+        return preferred
+    same = [c for c in space
+            if all(c[k] == preferred[k] for k in ("block_M", "threads", "num_stages"))]
+    assert same, f"no config near {preferred} fits in {SMEM_LIMIT / 1024:.0f} KB"
+    return max(same, key=lambda c: c["block_N"])
 
-assert FWD_TILES in fwd_configs(), "forward default is not a tunable config"
-assert BWD_TILES in bwd_configs(), "backward default is not a tunable config"
+
+AUTOTUNE = True
+FWD_TILES = fit_default(dict(block_M=128, block_N=64, threads=256, num_stages=1),
+                        fwd_configs())
+BWD_TILES = fit_default(dict(block_M=64, block_N=32, threads=128, num_stages=2),
+                        bwd_configs())
 
 
 if HAVE_TILELANG:
     FAST_MATH = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}
+    # CUDA 13.1's host_config.h only blesses MSVC 2019-2022 and this box has
+    # VS 18, so nvcc refuses every kernel.  Override it here; unset
+    # TL_NVCC_FLAGS (or install the 2022 build tools) to get the check back.
+    JIT_FLAGS = os.environ.get("TL_NVCC_FLAGS", "-allow-unsupported-compiler").split()
     FWD_SPACE = fwd_configs()
     BWD_SPACE = bwd_configs()
 
     @autotune(configs=FWD_SPACE, warmup=10, rep=20)
-    @tilelang.jit(out_idx=[3, 4], pass_configs=FAST_MATH)
+    @tilelang.jit(out_idx=[3, 4], pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def flash_fwd(batch, heads, seq_len, dim, causal, groups,
                   block_M=128, block_N=64, threads=256, num_stages=1):
         scale = (1.0 / dim) ** 0.5 * 1.44269504
@@ -170,7 +189,7 @@ if HAVE_TILELANG:
 
         return kernel
 
-    @tilelang.jit(out_idx=[2], pass_configs=FAST_MATH)
+    @tilelang.jit(out_idx=[2], pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def flash_delta(batch, heads, seq_len, dim):
         dt, acc = T.bfloat16, T.float32
         blk = 32
@@ -202,7 +221,7 @@ if HAVE_TILELANG:
                         lambda b, l, h, d: [b, l // 8, h, d // 8, (d % 2),
                                             4 * (l % 8) + (d % 8) // 2])
 
-    @tilelang.jit(out_idx=[1], pass_configs=FAST_MATH)
+    @tilelang.jit(out_idx=[1], pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def flash_unswizzle(batch, heads, seq_len, dim):
         dt, acc = T.bfloat16, T.float32
         blk = 64
@@ -221,7 +240,7 @@ if HAVE_TILELANG:
         return kernel
 
     @autotune(configs=BWD_SPACE, warmup=10, rep=20)
-    @tilelang.jit(pass_configs=FAST_MATH)
+    @tilelang.jit(pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def flash_bwd(batch, heads, seq_len, dim, causal, groups,
                   block_M=64, block_N=32, threads=128, num_stages=2):
         sm_scale = (1.0 / dim) ** 0.5
@@ -310,9 +329,20 @@ _kernels: dict = {}
 def get_kernel(kind, *shape):
     key = (kind, shape, AUTOTUNE)
     if key not in _kernels:
+        from mimans.model import tuned
+
         fn = flash_fwd if kind == "fwd" else flash_bwd
-        tiles = FWD_TILES if kind == "fwd" else BWD_TILES
-        _kernels[key] = fn(*shape) if AUTOTUNE else fn(*shape, **tiles)
+        name = f"attention_{kind}"
+        remembered = tuned.lookup(name, shape)
+        if remembered is not None:
+            # Tuned on this card already; build it straight away.
+            kernel = fn(*shape, **remembered)
+        elif AUTOTUNE:
+            kernel = fn(*shape)
+            tuned.record(name, shape, tuned.config_of(kernel))
+        else:
+            kernel = fn(*shape, **(FWD_TILES if kind == "fwd" else BWD_TILES))
+        _kernels[key] = kernel
     return _kernels[key]
 
 
@@ -457,8 +487,11 @@ class Attention(nn.Module):
         k = apply_rope(k, self.rope.cos, self.rope.sin)
 
         if backend == "tilelang":
-            out = flash_attention(q.contiguous(), k.contiguous(), v.contiguous(),
-                                  True, cfg.groups)
+            # bf16 kernel.  Under autocast q/k/v arrive bf16 already; this keeps
+            # the backend usable outside autocast too.
+            out = flash_attention(q.to(DTYPE).contiguous(), k.to(DTYPE).contiguous(),
+                                  v.to(DTYPE).contiguous(), True, cfg.groups)
+            out = out.to(x.dtype)
         else:
             qh, kh, vh = (t.transpose(1, 2) for t in (q, k, v))
             if backend == "sdpa":
@@ -624,10 +657,16 @@ def check_gpu(seq_len=512):
         q.grad = k.grad = v.grad = None
 
         print(f"\ncausal={causal}")
+        # Relative, not absolute.  Causal dK/dV accumulate over every query that
+        # can see the key, so they are simply bigger numbers, and one bf16 ulp
+        # at that magnitude is 6e-2 -- an absolute threshold measures the size
+        # of the gradient rather than the correctness of the kernel.
         for name, a, b in zip(("out", "dQ", "dK", "dV"),
                               [out] + mine, [want] + theirs):
             err = (a.float() - b.float()).abs().max().item()
-            print(f"  {name:4s} {err:.3e}  {'ok' if err < 2e-2 else 'FAIL'}")
+            rel = err / max(b.float().abs().max().item(), 1e-12)
+            print(f"  {name:4s} abs {err:.3e}  rel {rel:.3e}  "
+                  f"{'ok' if rel < 2e-2 else 'FAIL'}")
 
     runs = []
     for _ in range(2):

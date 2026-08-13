@@ -6,11 +6,11 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
-from norm import RMSNorm
-from attnres import ResidualState
-from attention_tilelang import Rotary
-from block import BlockConfig, TransformerBlock
-from lm_head_tilelang import HeadConfig, LMHead, IGNORE_INDEX
+from mimans.model.norm import RMSNorm
+from mimans.model.attnres import ResidualState
+from mimans.model.attention_tilelang import Rotary
+from mimans.model.block import BlockConfig, TransformerBlock
+from mimans.model.lm_head_tilelang import HeadConfig, LMHead, IGNORE_INDEX
 
 
 @dataclass

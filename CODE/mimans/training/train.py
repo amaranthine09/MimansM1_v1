@@ -8,9 +8,11 @@ from pathlib import Path
 
 import torch
 
-from model import ModelConfig, CodeModel
-from optim import OptimConfig, ScheduleConfig, HybridOptimizer, wsd_factor
-from data import DEFAULT_STAGES, stage_at, Loader
+from mimans import paths
+from mimans.model.model import ModelConfig, CodeModel
+from mimans.training.optim import (OptimConfig, ScheduleConfig,
+                                   HybridOptimizer, wsd_factor)
+from mimans.data import DEFAULT_STAGES, stage_at, Loader
 
 
 @dataclass
@@ -24,8 +26,19 @@ class TrainConfig:
     log_every: int = 10
     eval_every: int = 2_000
     save_every: int = 2_000
+    # A step is ~29 seconds, so save_every=2000 is about 16 hours -- a whole
+    # session could finish without ever checkpointing, and a crash at hour 15
+    # would cost the lot.  Wall clock saving is what actually bounds the loss.
+    save_every_minutes: float = 45.0
+    session_hours: float = 16.0
     keep_last: int = 5
-    out_dir: str = "runs/smolcoder"
+    # One checkpoint every this many steps is kept for good, on top of
+    # keep_last, so there is a way back after a loss spike.  8,000 steps is
+    # about 4B tokens: ten permanent restore points across the run.
+    milestone_steps: int = 8_000
+    # Measured, not estimated: 4.37 GB per checkpoint and 18s to write.  Five
+    # kept plus ten milestones is ~66 GB, which is why this lives on D:.
+    out_dir: str = str(paths.RUNS / "smolcoder")
     power_limit_watts: int = 500
 
     @property
@@ -51,11 +64,12 @@ def model_flops_utilization(flops_per_token, tokens_per_second, peak_tflops):
 
 class Trainer:
     def __init__(self, model: CodeModel, loader: Loader, cfg: TrainConfig,
-                 optim_cfg: OptimConfig = None, device="cuda"):
+                 optim_cfg: OptimConfig = None, device="cuda", stages=None):
         self.model = model
         self.loader = loader
         self.cfg = cfg
         self.device = device
+        self.stages = stages or DEFAULT_STAGES
         schedule = ScheduleConfig(total_steps=cfg.total_steps)
         self.opt = HybridOptimizer(model, optim_cfg or OptimConfig(), schedule)
         self.step = 0
@@ -82,7 +96,7 @@ class Trainer:
         return report
 
     def current_stage(self):
-        return stage_at(self.tokens_seen, DEFAULT_STAGES)
+        return stage_at(self.tokens_seen, self.stages)
 
     def maybe_switch_stage(self):
         stage = self.current_stage()
@@ -92,9 +106,24 @@ class Trainer:
         if stage.rope_theta != self.model.cfg.rope_theta:
             self.model.set_rope_theta(stage.rope_theta)
         if stage.seq_len != self.cfg.seq_len:
+            # Hold tokens per micro batch constant across the switch.  Leaving
+            # micro_batch alone while the context goes 2048 -> 8192 quadruples
+            # activation memory 20 days into the run and drops grad_accum from
+            # 32 to 8 without saying so; if seq_len ever stops dividing the
+            # global batch it silently becomes zero.  The loader hands out
+            # micro_batch rows, so it has to move in step.
+            per_micro = self.cfg.micro_batch * self.cfg.seq_len
+            micro = max(1, per_micro // stage.seq_len)
+            assert self.cfg.global_batch_tokens % (micro * stage.seq_len) == 0, (
+                f"stage {stage.name}: {micro} x {stage.seq_len} does not divide "
+                f"the {self.cfg.global_batch_tokens:,} token global batch")
+            self.cfg.micro_batch = micro
             self.cfg.seq_len = stage.seq_len
+            self.loader.batch_size = micro
         return {"from": previous.name if previous else None,
                 "to": stage.name, "seq_len": stage.seq_len,
+                "micro_batch": self.cfg.micro_batch,
+                "grad_accum": self.cfg.grad_accum,
                 "rope_theta": stage.rope_theta, "weights": stage.weights}
 
     def train_step(self):
@@ -154,12 +183,36 @@ class Trainer:
         self.prune_checkpoints()
         return path
 
+    @staticmethod
+    def _step_of(path: Path):
+        return int(path.stem.replace("step", ""))
+
     def prune_checkpoints(self):
-        saved = sorted(self.out.glob("step*.pt"))
-        keep = self.cfg.keep_last
-        for path in saved[:-keep] if len(saved) > keep else []:
-            index = int(path.stem.replace("step", ""))
-            if index % (self.cfg.save_every * 10) != 0:
+        """Keep the last few, plus one every milestone_steps, forever.
+
+        Checkpoints are written on a wall clock interval, so their step numbers
+        are whatever the run happened to reach -- 93, 186, 279.  The old test
+        here kept a checkpoint only if its step divided exactly into a
+        milestone, which such numbers never do, so every older checkpoint was
+        deleted and there was no way back to 10B tokens after a loss spike at
+        20B.  Bucketing by step keeps one per milestone whatever the numbers
+        land on.
+        """
+        saved = sorted(self.out.glob("step*.pt"), key=self._step_of)
+        if not saved:
+            return
+        keep = set(saved[-self.cfg.keep_last:]) if self.cfg.keep_last else set()
+
+        milestone = self.cfg.milestone_steps
+        if milestone:
+            first_in_bucket = {}
+            for path in saved:
+                bucket = self._step_of(path) // milestone
+                first_in_bucket.setdefault(bucket, path)
+            keep |= set(first_in_bucket.values())
+
+        for path in saved:
+            if path not in keep:
                 path.unlink()
 
     def load(self, path):
@@ -168,20 +221,53 @@ class Trainer:
         self.opt.load_state_dict(state["optimizer"])
         self.step = state["step"]
         self.tokens_seen = state["tokens_seen"]
-        torch.set_rng_state(state["cpu_rng"])
+        # map_location moved every tensor in the checkpoint to the device,
+        # including the rng state, and set_rng_state only takes a cpu
+        # ByteTensor.  Without these, every resume dies on the first restart.
+        torch.set_rng_state(state["cpu_rng"].cpu())
         if state["cuda_rng"] is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state["cuda_rng"])
+            torch.cuda.set_rng_state_all([t.cpu() for t in state["cuda_rng"]])
         self.stage = None
         return state
 
-    def run(self, max_steps=None):
+    def latest_checkpoint(self):
+        """Newest step*.pt in the output directory, by step number rather than
+        mtime -- a resumed run rewrites older files and mtime lies."""
+        saved = sorted(self.out.glob("step*.pt"),
+                       key=lambda p: int(p.stem.replace("step", "")))
+        return saved[-1] if saved else None
+
+    def run(self, max_steps=None, max_seconds=None):
         cfg = self.cfg
         stop = min(max_steps or cfg.total_steps, cfg.total_steps)
         log_path = self.out / "log.jsonl"
         started = time.time()
         window = time.time()
+        last_save = time.time()
+        reason = "reached the step budget"
+
+        # Ctrl+C mid step would throw away everything since the last save, so
+        # catch it, finish the step in flight, and fall out of the loop into
+        # the final checkpoint below.
+        self._stopping = False
+
+        def request_stop(signum, frame):
+            if self._stopping:            # second Ctrl+C, let it through
+                raise KeyboardInterrupt
+            self._stopping = True
+            print("\n[stopping] finishing this step, then checkpointing. "
+                  "Ctrl+C again to abandon it.", flush=True)
+
+        previous = signal.signal(signal.SIGINT, request_stop)
 
         while self.step < stop:
+            if max_seconds is not None and time.time() - started >= max_seconds:
+                reason = f"hit the {max_seconds/3600:.1f} hour session limit"
+                break
+            if self._stopping:
+                reason = "interrupted"
+                break
+
             metrics = self.train_step()
 
             if metrics["stage_switch"]:
@@ -210,10 +296,25 @@ class Trainer:
                 with open(log_path, "a") as handle:
                     handle.write(json.dumps(record) + "\n")
 
-            if cfg.save_every and self.step % cfg.save_every == 0:
+            by_step = cfg.save_every and self.step % cfg.save_every == 0
+            by_time = (cfg.save_every_minutes
+                       and time.time() - last_save >= cfg.save_every_minutes * 60)
+            if by_step or by_time:
                 self.save()
+                last_save = time.time()
 
-        return self.step
+        signal.signal(signal.SIGINT, previous)
+
+        # Always land on a checkpoint, whatever ended the loop.  Without this a
+        # session that stops on the clock leaves up to save_every_minutes of
+        # work on the floor.
+        path = self.save()
+        elapsed = time.time() - started
+        print(f"\n[session] {reason} after {elapsed/3600:.2f} h, "
+              f"step {self.step:,}, {self.tokens_seen/1e9:.3f}B tokens seen")
+        print(f"[session] checkpoint {path}")
+        return {"step": self.step, "tokens_seen": self.tokens_seen,
+                "hours": elapsed / 3600, "reason": reason, "checkpoint": path}
 
 
 def check():

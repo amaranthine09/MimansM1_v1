@@ -4,10 +4,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from norm import RMSNorm
-from attnres import AttnResGate, ResidualState
-from attention_tilelang import Attention, AttnConfig, Rotary
-from swiglu_tilelang import SwiGLU, FFNConfig
+from mimans.model.norm import RMSNorm
+from mimans.model.attnres import AttnResGate, ResidualState
+from mimans.model.attention_tilelang import Attention, AttnConfig, Rotary
+from mimans.model.swiglu_tilelang import SwiGLU, FFNConfig
 
 
 @dataclass

@@ -1,13 +1,17 @@
-from __future__ import annotations
-
+# no "from __future__ import annotations" here: tilelang reads the prim_func
+# signature with get_type_hints, and PEP 563 would leave T.Tensor([batch, ...])
+# as a string that cannot see the enclosing function's locals.
 import argparse
 import itertools
 import math
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from mimans import paths  # noqa: F401  points the kernel cache at D:, must precede tilelang
 
 try:
     import tilelang
@@ -68,6 +72,25 @@ def gate_up_configs(limit=None):
             and bm * bn * 4 * 2 <= MAX_ACCUM_BYTES]
 
 
+def tunable(configs, max_rows_per_warp=16):
+    """Drop the configs that are valid but pathologically slow to benchmark.
+
+    warps_fit allows block_M=128 with threads=128, which gives each warp 32
+    rows of the tile.  On sm_120 at these shapes those kernels are slow enough
+    that the autotuner's benchmark times out on each one, and a search that
+    should take minutes takes hours: the tuning run that stalled had cleared
+    all 19 block_M=64 configs in seconds and then hung on the first
+    block_M=128, threads=128 candidate.  Every config that actually won was at
+    16 rows per warp.
+
+    This filters the search only.  The defaults stay legal configs, so the
+    asserts below still hold and nothing that already works is taken away.
+    """
+    kept = [c for c in configs
+            if c["block_M"] // max(1, c["threads"] // 32) <= max_rows_per_warp]
+    return kept or configs
+
+
 def grad_configs(limit=None):
     limit = limit or SMEM_LIMIT
     return [dict(block_M=bm, block_N=bn, threads=t)
@@ -86,11 +109,15 @@ assert GRAD_TILES in grad_configs(), "grad default is not a tunable config"
 
 if HAVE_TILELANG:
     FAST_MATH = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}
-    GATE_UP_SPACE = gate_up_configs()
-    GRAD_SPACE = grad_configs()
+    # CUDA 13.1's host_config.h only blesses MSVC 2019-2022 and this box has
+    # VS 18, so nvcc refuses every kernel.  Override it here; unset
+    # TL_NVCC_FLAGS (or install the 2022 build tools) to get the check back.
+    JIT_FLAGS = os.environ.get("TL_NVCC_FLAGS", "-allow-unsupported-compiler").split()
+    GATE_UP_SPACE = tunable(gate_up_configs())
+    GRAD_SPACE = tunable(grad_configs())
 
     @autotune(configs=GATE_UP_SPACE, warmup=10, rep=20)
-    @tilelang.jit(out_idx=[3], pass_configs=FAST_MATH)
+    @tilelang.jit(out_idx=[3], pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def gate_up_swiglu(tokens, d_model, ffn,
                        block_M=128, block_N=64, block_K=64,
                        threads=128, num_stages=2):
@@ -129,7 +156,7 @@ if HAVE_TILELANG:
         return kernel
 
     @autotune(configs=GATE_UP_SPACE, warmup=10, rep=20)
-    @tilelang.jit(out_idx=[3, 4], pass_configs=FAST_MATH)
+    @tilelang.jit(out_idx=[3, 4], pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def gate_up_split(tokens, d_model, ffn,
                       block_M=128, block_N=64, block_K=64,
                       threads=128, num_stages=2):
@@ -173,7 +200,7 @@ if HAVE_TILELANG:
         return kernel
 
     @autotune(configs=GRAD_SPACE, warmup=10, rep=20)
-    @tilelang.jit(out_idx=[3, 4], pass_configs=FAST_MATH)
+    @tilelang.jit(out_idx=[3, 4], pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def swiglu_grad(tokens, ffn, block_M=128, block_N=64, threads=128):
         dt, acc = T.bfloat16, T.float32
 
@@ -219,11 +246,21 @@ _kernels: dict = {}
 def get_kernel(kind, *shape):
     key = (kind, shape, AUTOTUNE)
     if key not in _kernels:
+        from mimans.model import tuned
+
         fn = {"gate_up": gate_up_swiglu,
               "split": gate_up_split,
               "grad": swiglu_grad}[kind]
-        tiles = GRAD_TILES if kind == "grad" else GATE_UP_TILES
-        _kernels[key] = fn(*shape) if AUTOTUNE else fn(*shape, **tiles)
+        name = f"swiglu_{kind}"
+        remembered = tuned.lookup(name, shape)
+        if remembered is not None:
+            kernel = fn(*shape, **remembered)
+        elif AUTOTUNE:
+            kernel = fn(*shape)
+            tuned.record(name, shape, tuned.config_of(kernel))
+        else:
+            kernel = fn(*shape, **(GRAD_TILES if kind == "grad" else GATE_UP_TILES))
+        _kernels[key] = kernel
     return _kernels[key]
 
 
@@ -302,7 +339,13 @@ class SwiGLU(nn.Module):
         flat = x.reshape(-1, cfg.d_model)
 
         if backend == "tilelang":
-            out = fused_swiglu(flat, self.w_gate, self.w_up, self.w_down)
+            # The kernels are compiled for bf16.  Autocast does not reach in
+            # here: the residual stream stays fp32 because the embedding is not
+            # an autocast op, and these are raw nn.Parameters rather than an
+            # nn.Linear, so nothing casts them for us.
+            out = fused_swiglu(flat.to(DTYPE), self.w_gate.to(DTYPE),
+                               self.w_up.to(DTYPE), self.w_down.to(DTYPE))
+            out = out.to(x.dtype)
         elif backend == "torch":
             out = (F.silu(flat @ self.w_gate) * (flat @ self.w_up)) @ self.w_down
         elif backend == "math":

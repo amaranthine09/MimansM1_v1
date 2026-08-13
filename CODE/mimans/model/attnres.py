@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
-from CODE.Model.norm import RMSNorm
+from mimans.model.norm import RMSNorm
 
 
 @dataclass

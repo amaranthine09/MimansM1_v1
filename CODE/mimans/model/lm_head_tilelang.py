@@ -1,13 +1,17 @@
-from __future__ import annotations
-
+# no "from __future__ import annotations" here: tilelang reads the prim_func
+# signature with get_type_hints, and PEP 563 would leave T.Tensor([batch, ...])
+# as a string that cannot see the enclosing function's locals.
 import argparse
 import itertools
 import math
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from mimans import paths  # noqa: F401  points the kernel cache at D:, must precede tilelang
 
 try:
     import tilelang
@@ -77,10 +81,16 @@ assert VOCAB_CHUNK % 128 == 0, "vocab chunk should stay tensor core aligned"
 
 if HAVE_TILELANG:
     FAST_MATH = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}
-    LSE_SPACE = lse_configs()
+    # CUDA 13.1's host_config.h only blesses MSVC 2019-2022 and this box has
+    # VS 18, so nvcc refuses every kernel.  Override it here; unset
+    # TL_NVCC_FLAGS (or install the 2022 build tools) to get the check back.
+    JIT_FLAGS = os.environ.get("TL_NVCC_FLAGS", "-allow-unsupported-compiler").split()
+    # Same 32-rows-per-warp trap as the swiglu kernels; see swiglu.tunable.
+    from mimans.model.swiglu_tilelang import tunable
+    LSE_SPACE = tunable(lse_configs())
 
     @autotune(configs=LSE_SPACE, warmup=10, rep=20)
-    @tilelang.jit(out_idx=[2], pass_configs=FAST_MATH)
+    @tilelang.jit(out_idx=[2], pass_configs=FAST_MATH, compile_flags=JIT_FLAGS)
     def logsumexp_kernel(tokens, d_model, vocab,
                          block_M=128, block_N=128, block_K=64,
                          threads=128, num_stages=2):
@@ -102,10 +112,15 @@ if HAVE_TILELANG:
                 tile_sum = T.alloc_fragment([block_M], acc)
                 total = T.alloc_fragment([block_M], acc)
 
-                T.fill(row_max, -T.infinity(acc))
-                T.fill(total, 0)
-
                 for n in T.serial(T.ceildiv(vocab, block_N)):
+                    # Seed the running max and sum inside the loop, predicated on
+                    # the first tile.  Warp specialisation for the pipelined k
+                    # loop below sinks a *pre-loop* T.fill into the consumer
+                    # branch inside this loop, which restarts the accumulator on
+                    # every vocab tile and silently keeps only the last one.
+                    for i in T.Parallel(block_M):
+                        row_max[i] = T.if_then_else(n == 0, -T.infinity(acc), row_max[i])
+                        total[i] = T.if_then_else(n == 0, T.Cast(acc, 0), total[i])
                     T.clear(logits)
                     for k in T.Pipelined(T.ceildiv(d_model, block_K),
                                          num_stages=num_stages):
@@ -119,11 +134,13 @@ if HAVE_TILELANG:
                         logits[i, j] = T.if_then_else(
                             n * block_N + j >= vocab, -T.infinity(acc), logits[i, j])
 
-                    T.copy(row_max, prev_max)
-                    T.fill(row_max, -T.infinity(acc))
-                    T.reduce_max(logits, row_max, dim=1, clear=False)
+                    # Save the running max with an explicit elementwise loop.
+                    # T.copy between two fragments does not survive here, and a
+                    # prev_max stuck at -inf makes every rescale zero, which
+                    # silently throws away every vocab tile but the last.
                     for i in T.Parallel(block_M):
-                        row_max[i] = T.max(row_max[i], prev_max[i])
+                        prev_max[i] = row_max[i]
+                    T.reduce_max(logits, row_max, dim=1, clear=False)
                     for i in T.Parallel(block_M):
                         rescale[i] = T.exp(prev_max[i] - row_max[i])
                     for i, j in T.Parallel(block_M, block_N):
@@ -145,8 +162,17 @@ _kernels: dict = {}
 def get_kernel(shape):
     key = (shape, AUTOTUNE)
     if key not in _kernels:
-        _kernels[key] = (logsumexp_kernel(*shape) if AUTOTUNE
-                         else logsumexp_kernel(*shape, **LSE_TILES))
+        from mimans.model import tuned
+
+        remembered = tuned.lookup("lm_head_lse", shape)
+        if remembered is not None:
+            kernel = logsumexp_kernel(*shape, **remembered)
+        elif AUTOTUNE:
+            kernel = logsumexp_kernel(*shape)
+            tuned.record("lm_head_lse", shape, tuned.config_of(kernel))
+        else:
+            kernel = logsumexp_kernel(*shape, **LSE_TILES)
+        _kernels[key] = kernel
     return _kernels[key]
 
 
@@ -157,10 +183,18 @@ def warmup(tokens, d_model=1280, vocab=49152):
     print("cached to disk")
 
 
+def accum_dtype(tensor):
+    """fp32 for the dtypes we train in, but never narrower than what we were
+    handed: a plain .float() would silently drop an fp64 gradient check to
+    fp32 and cap its accuracy at 1e-7."""
+    return torch.promote_types(tensor.dtype, torch.float32)
+
+
 def gather_target_logits(hidden, weight, targets):
+    acc = accum_dtype(hidden)
     valid = targets.clamp(min=0)
     rows = weight.index_select(1, valid).t()
-    return (hidden.float() * rows.float()).sum(-1)
+    return (hidden.to(acc) * rows.to(acc)).sum(-1)
 
 
 class FusedCrossEntropy(torch.autograd.Function):
@@ -171,10 +205,11 @@ class FusedCrossEntropy(torch.autograd.Function):
         mask = targets != IGNORE_INDEX
         count = mask.sum().clamp(min=1)
 
-        if HAVE_TILELANG and hidden.is_cuda:
+        acc = accum_dtype(hidden)
+        if HAVE_TILELANG and hidden.is_cuda and hidden.dtype is DTYPE:
             lse = get_kernel((tokens, d_model, vocab))(hidden, weight)
         else:
-            lse = torch.logsumexp((hidden.float() @ weight.float()), dim=-1)
+            lse = torch.logsumexp((hidden.to(acc) @ weight.to(acc)), dim=-1)
 
         target_logit = gather_target_logits(hidden, weight, targets)
         per_token = torch.where(mask, lse - target_logit,
@@ -194,22 +229,23 @@ class FusedCrossEntropy(torch.autograd.Function):
         mask = (targets != IGNORE_INDEX).unsqueeze(1)
         scale = grad_loss / count
 
-        d_hidden = torch.zeros_like(hidden, dtype=torch.float32)
-        d_weight = torch.zeros_like(weight, dtype=torch.float32)
+        acc = accum_dtype(hidden)
+        d_hidden = torch.zeros_like(hidden, dtype=acc)
+        d_weight = torch.zeros_like(weight, dtype=acc)
         rows = torch.arange(tokens, device=hidden.device)
 
         for start in range(0, vocab, chunk):
             stop = min(start + chunk, vocab)
             w_chunk = weight[:, start:stop]
-            logits = hidden.float() @ w_chunk.float()
+            logits = hidden.to(acc) @ w_chunk.to(acc)
             probs = torch.exp(logits - lse.unsqueeze(1))
             hit = (targets >= start) & (targets < stop) & (targets != IGNORE_INDEX)
             if hit.any():
                 idx = rows[hit]
                 probs[idx, targets[hit] - start] -= 1.0
             probs = probs * mask * scale
-            d_hidden += probs @ w_chunk.float().t()
-            d_weight[:, start:stop] = hidden.float().t() @ probs
+            d_hidden += probs @ w_chunk.to(acc).t()
+            d_weight[:, start:stop] = hidden.to(acc).t() @ probs
 
         return d_hidden.to(hidden.dtype), d_weight.to(weight.dtype), None, None
 
@@ -224,10 +260,21 @@ class HeadConfig:
     vocab: int = 49152
     tied: bool = True
     chunk: int = VOCAB_CHUNK
+    logit_scale: float = None
 
     def __post_init__(self):
         assert self.vocab % 128 == 0
         assert self.d_model % 128 == 0
+        # A tied head reading a zero-init identity stack sees hidden =
+        # RMSNorm(E[token]), so the token's own logit is |E|^2/rms(E) =
+        # d_model * init_std = 25.6 while every other logit sits near zero.
+        # The model then starts out certain that the answer is the token it was
+        # just given, and step 0 costs 25.3 nats instead of log(vocab) = 10.8.
+        # Scaling the logits by 1/sqrt(d_model) puts that back at 0.72 nats of
+        # signal, which is the log(vocab) start the design report asks for.
+        # Set logit_scale=1.0 to get the unscaled behaviour back.
+        if self.logit_scale is None:
+            self.logit_scale = self.d_model ** -0.5
 
     @property
     def params(self):
@@ -255,6 +302,10 @@ class LMHead(nn.Module):
     def forward(self, hidden, targets=None, backend="tilelang"):
         shape = hidden.shape
         flat = hidden.reshape(-1, self.cfg.d_model)
+        # Scaling the input is the same as scaling the logits, and it keeps the
+        # kernel free of a scale it would have to fold into its own accumulator.
+        if self.cfg.logit_scale != 1.0:
+            flat = flat * self.cfg.logit_scale
         weight = self.matrix()
 
         if targets is None:
@@ -262,10 +313,28 @@ class LMHead(nn.Module):
 
         flat_targets = targets.reshape(-1)
         if backend == "tilelang":
+            # The kernel is compiled for bf16.  Under autocast the residual
+            # stream is still fp32 (the embedding is not an autocast op), and
+            # the tied matrix is always fp32, so cast both here -- otherwise the
+            # dtype guard in FusedCrossEntropy quietly drops to the torch path
+            # and materialises the [tokens, vocab] logits this kernel exists to
+            # avoid.  The fp64 gradient checks call the function directly and
+            # keep their own precision.
+            # matrix() hands back embedding.weight.t(), a transposed view, and
+            # the kernel's packed ABI wants a real [d_model, vocab] layout.
+            if HAVE_TILELANG and flat.is_cuda:
+                flat = flat.to(DTYPE).contiguous()
+                weight = weight.to(DTYPE).contiguous()
             return fused_cross_entropy(flat, weight, flat_targets, self.cfg.chunk)
         if backend == "torch":
-            return F.cross_entropy(flat.float() @ weight.float(), flat_targets,
-                                   ignore_index=IGNORE_INDEX)
+            # sum over the valid rows divided by their count, matching the fused
+            # path.  Plain F.cross_entropy means 0/0 -> nan when a microbatch is
+            # entirely ignore_index, and one nan poisons the whole run.
+            acc = accum_dtype(flat)
+            valid = (flat_targets != IGNORE_INDEX).sum().clamp(min=1)
+            return F.cross_entropy(flat.to(acc) @ weight.to(acc), flat_targets,
+                                   ignore_index=IGNORE_INDEX,
+                                   reduction="sum") / valid
         raise ValueError(f"unknown backend {backend!r}")
 
 
@@ -354,7 +423,7 @@ def check_math():
     print("\nend to end against F.cross_entropy")
     d_model, vocab, n = 64, 300, 128
     hidden = torch.randn(n, d_model, dtype=torch.float64, requires_grad=True)
-    weight = torch.randn(d_model, vocab, dtype=torch.float64, requires_grad=True) * 0.05
+    weight = (torch.randn(d_model, vocab, dtype=torch.float64) * 0.05).requires_grad_()
     targets = torch.randint(0, vocab, (n,))
     targets[:8] = IGNORE_INDEX
 
